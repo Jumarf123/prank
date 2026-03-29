@@ -352,17 +352,11 @@ function Start-FakeConsoles {
             "echo."
             "echo [BOOT] launching remote shell node $i"
             "echo."
-            ":loop"
-            "echo [!time!] node ${i}: acquiring session token !random!!random!"
-            "echo [!time!] node ${i}: reading memory page !random!"
-            "echo [!time!] node ${i}: syncing registry delta !random!-!random!"
-            "echo [!time!] node ${i}: bypass chain ok, tunnel depth !random!"
-            "echo [!time!] node ${i}: uplink established, checksum !random!!random!"
-            "ping 127.0.0.1 -n 2 >nul"
-            "goto loop"
+            "for /L %g in (1,1,1000000) do @(echo [!time!] node ${i}: acquiring session token !random!!random! & echo [!time!] node ${i}: reading memory page !random! & echo [!time!] node ${i}: syncing registry delta !random!-!random! & echo [!time!] node ${i}: bypass chain ok, tunnel depth !random! & echo [!time!] node ${i}: uplink established, checksum !random!!random! & ping 127.0.0.1 -n 2 >nul)"
         ) -join " & "
 
-        $process = Start-Process -FilePath "cmd.exe" -ArgumentList @("/v:on", "/k", $command) -PassThru
+        $arguments = "/v:on /k `"$command`""
+        $process = Start-Process -FilePath "cmd.exe" -ArgumentList $arguments -PassThru
         [void]$script:ConsoleProcesses.Add($process)
         Start-Sleep -Milliseconds 120
     }
