@@ -54,12 +54,23 @@ function Sync-RepoImages {
 
     foreach ($name in $names) {
         $targetPath = Join-Path $DestinationPath $name
-        if (Test-Path $targetPath) {
+        if ((Test-Path $targetPath) -and (Get-Item $targetPath).Length -gt 0) {
             continue
         }
 
         $imageUrl = "$($script:RawRoot)/images/$name"
-        Invoke-WebRequest -Uri $imageUrl -OutFile $targetPath
+        $tempPath = "$targetPath.download"
+
+        if (Test-Path $targetPath) {
+            Remove-Item -Path $targetPath -Force -ErrorAction SilentlyContinue
+        }
+
+        if (Test-Path $tempPath) {
+            Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
+        }
+
+        Invoke-WebRequest -Uri $imageUrl -OutFile $tempPath
+        Move-Item -Path $tempPath -Destination $targetPath -Force
     }
 
     @(
