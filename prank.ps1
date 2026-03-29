@@ -4,13 +4,13 @@ param(
     [int]$Count = 10,
     [string]$CacheRoot = (Join-Path $env:TEMP "img-cache"),
     [ValidateRange(1, 100)]
-    [int]$FrameDelayMs = 8,
+    [int]$FrameDelayMs = 10,
     [ValidateRange(1, 200)]
-    [int]$WallpaperIntervalMs = 1200,
+    [int]$WallpaperIntervalMs = 1800,
     [ValidateRange(100, 8000)]
-    [int]$MinSpeed = 1100,
+    [int]$MinSpeed = 520,
     [ValidateRange(100, 8000)]
-    [int]$MaxSpeed = 2200,
+    [int]$MaxSpeed = 860,
     [int]$Iterations = 0,
     [switch]$DownloadOnly
 )
@@ -207,6 +207,48 @@ if (Test-Path '$safeStatePath') {
     ) | Out-Null
 }
 
+function Start-WallpaperLoop {
+    param(
+        [int]$ParentId,
+        [string[]]$Paths,
+        [int]$IntervalMs
+    )
+
+    if ($Paths.Count -eq 0) {
+        return
+    }
+
+    $pathLiteral = ($Paths | ForEach-Object {
+        "'{0}'" -f ($_.Replace("'", "''"))
+    }) -join ",`r`n"
+
+    $helper = @"
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class CycleApi {
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+}
+'@
+`$paths = @(
+$pathLiteral
+)
+`$index = 0
+while (Get-Process -Id $ParentId -ErrorAction SilentlyContinue) {
+    [CycleApi]::SystemParametersInfo(20, 0, `$paths[`$index % `$paths.Count], 3) | Out-Null
+    `$index++
+    Start-Sleep -Milliseconds $IntervalMs
+}
+"@
+
+    Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-Command", $helper
+    ) | Out-Null
+}
+
 function Set-MotionVector {
     param(
         [pscustomobject]$Entry,
@@ -225,23 +267,14 @@ function Initialize-Motion {
     )
 
     Set-MotionVector -Entry $Entry -Angle ($script:Random.NextDouble() * [Math]::PI * 2) -Speed ($MinSpeed + ($script:Random.NextDouble() * ($MaxSpeed - $MinSpeed)))
-    $Entry.NextTurnTick = $script:Random.Next(140, 420)
 }
 
 function Update-Windows {
     param(
-        [double]$DeltaSeconds,
-        [double]$NowMs
+        [double]$DeltaSeconds
     )
 
     foreach ($entry in $script:Windows) {
-        if ($NowMs -ge $entry.NextTurnTick) {
-            $angle = [Math]::Atan2($entry.VY, $entry.VX) + (($script:Random.NextDouble() * 0.9) - 0.45)
-            $speed = [Math]::Sqrt(($entry.VX * $entry.VX) + ($entry.VY * $entry.VY)) + $script:Random.Next(-220, 221)
-            Set-MotionVector -Entry $entry -Angle $angle -Speed $speed
-            $entry.NextTurnTick = $NowMs + $script:Random.Next(140, 420)
-        }
-
         $window = $entry.Window
         $newLeft = $window.Left + ($entry.VX * $DeltaSeconds)
         $newTop = $window.Top + ($entry.VY * $DeltaSeconds)
@@ -415,7 +448,6 @@ foreach ($imgFile in $images) {
         File = $imgFile.FullName
         VX = 0.0
         VY = 0.0
-        NextTurnTick = 0.0
     }
 
     Initialize-Motion -Entry $entry
@@ -427,6 +459,7 @@ foreach ($entry in $script:Windows) {
 }
 
 Invoke-DoEvents
+Start-WallpaperLoop -ParentId $PID -Paths ($images.FullName) -IntervalMs $WallpaperIntervalMs
 
 $index = 0
 $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -439,18 +472,16 @@ try {
         $deltaSeconds = [Math]::Max(0.001, ($now - $lastFrameTick) / 1000.0)
         $lastFrameTick = $now
 
-        if ($now -ge $nextWallpaperTick) {
-            $entry = $script:Windows[$index % $script:Windows.Count]
-            Set-WallpaperPath -Path $entry.File
+        if ($Iterations -gt 0 -and $now -ge $nextWallpaperTick) {
             $index++
             $nextWallpaperTick = $now + $WallpaperIntervalMs
 
-            if ($Iterations -gt 0 -and $index -ge $Iterations) {
+            if ($index -ge $Iterations) {
                 break
             }
         }
 
-        Update-Windows -DeltaSeconds $deltaSeconds -NowMs $now
+        Update-Windows -DeltaSeconds $deltaSeconds
         Invoke-DoEvents
         Start-Sleep -Milliseconds $FrameDelayMs
     }
