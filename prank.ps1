@@ -3,14 +3,10 @@ param(
     [ValidateRange(1, 256)]
     [int]$Count = 10,
     [string]$CacheRoot = (Join-Path $env:TEMP "img-cache"),
-    [ValidateRange(1, 100)]
-    [int]$FrameDelayMs = 10,
-    [ValidateRange(1, 200)]
-    [int]$WallpaperIntervalMs = 1800,
     [ValidateRange(100, 8000)]
-    [int]$MinSpeed = 520,
+    [int]$MinSpeed = 280,
     [ValidateRange(100, 8000)]
-    [int]$MaxSpeed = 860,
+    [int]$MaxSpeed = 460,
     [int]$Iterations = 0,
     [switch]$DownloadOnly
 )
@@ -137,21 +133,6 @@ function Sync-Images {
     )
 }
 
-function Invoke-DoEvents {
-    $frame = [Windows.Threading.DispatcherFrame]::new()
-    [Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
-        [Windows.Threading.DispatcherPriority]::Background,
-        [Windows.Threading.DispatcherOperationCallback]{
-            param($state)
-            ([Windows.Threading.DispatcherFrame]$state).Continue = $false
-            $null
-        },
-        $frame
-    ) | Out-Null
-
-    [Windows.Threading.Dispatcher]::PushFrame($frame)
-}
-
 function Set-WallpaperPath {
     param(
         [string]$Path
@@ -197,48 +178,6 @@ if (Test-Path '$safeStatePath') {
     `$value = Get-Content -Path '$safeStatePath' -Raw -ErrorAction SilentlyContinue
     [ExitApi]::SystemParametersInfo(20, 0, `$value, 3) | Out-Null
     Remove-Item -Path '$safeStatePath' -Force -ErrorAction SilentlyContinue
-}
-"@
-
-    Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-Command", $helper
-    ) | Out-Null
-}
-
-function Start-WallpaperLoop {
-    param(
-        [int]$ParentId,
-        [string[]]$Paths,
-        [int]$IntervalMs
-    )
-
-    if ($Paths.Count -eq 0) {
-        return
-    }
-
-    $pathLiteral = ($Paths | ForEach-Object {
-        "'{0}'" -f ($_.Replace("'", "''"))
-    }) -join ",`r`n"
-
-    $helper = @"
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class CycleApi {
-    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-    public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
-}
-'@
-`$paths = @(
-$pathLiteral
-)
-`$index = 0
-while (Get-Process -Id $ParentId -ErrorAction SilentlyContinue) {
-    [CycleApi]::SystemParametersInfo(20, 0, `$paths[`$index % `$paths.Count], 3) | Out-Null
-    `$index++
-    Start-Sleep -Milliseconds $IntervalMs
 }
 "@
 
@@ -304,6 +243,18 @@ function Update-Windows {
     }
 }
 
+function Stop-Animation {
+    if (-not $script:Running) {
+        return
+    }
+
+    $script:Running = $false
+
+    if ($null -ne $script:MainDispatcher -and -not $script:MainDispatcher.HasShutdownStarted) {
+        $script:MainDispatcher.BeginInvokeShutdown([Windows.Threading.DispatcherPriority]::Background)
+    }
+}
+
 function Restore-State {
     if ($script:CleanupDone) {
         return
@@ -311,6 +262,14 @@ function Restore-State {
 
     $script:CleanupDone = $true
     $script:Running = $false
+
+    if ($null -ne $script:RenderHandler) {
+        try {
+            [Windows.Media.CompositionTarget]::remove_Rendering($script:RenderHandler)
+        }
+        catch {
+        }
+    }
 
     foreach ($entry in $script:Windows) {
         try {
@@ -375,6 +334,8 @@ $script:CleanupDone = $false
 $script:Running = $true
 $script:Client = $null
 $script:ExitSubscription = $null
+$script:RenderHandler = $null
+$script:MainDispatcher = $null
 $script:OriginalWallpaper = Get-RestorePath
 $script:StatePath = Join-Path $env:TEMP ("{0}.txt" -f [guid]::NewGuid().ToString("N"))
 
@@ -458,33 +419,43 @@ foreach ($entry in $script:Windows) {
     $entry.Window.Show()
 }
 
-Invoke-DoEvents
-Start-WallpaperLoop -ParentId $PID -Paths ($images.FullName) -IntervalMs $WallpaperIntervalMs
+Set-WallpaperPath -Path $images[$script:Random.Next(0, $images.Count)].FullName
 
-$index = 0
-$clock = [Diagnostics.Stopwatch]::StartNew()
-$lastFrameTick = 0
-$nextWallpaperTick = 0
+$script:MainDispatcher = [Windows.Threading.Dispatcher]::CurrentDispatcher
+$script:Clock = [Diagnostics.Stopwatch]::StartNew()
+$script:LastFrameSeconds = $script:Clock.Elapsed.TotalSeconds
+$script:FrameCount = 0
+$script:RenderHandler = [EventHandler]{
+    param($sender, $eventArgs)
+
+    if (-not $script:Running) {
+        return
+    }
+
+    $nowSeconds = $script:Clock.Elapsed.TotalSeconds
+    $deltaSeconds = $nowSeconds - $script:LastFrameSeconds
+    if ($deltaSeconds -le 0) {
+        return
+    }
+
+    $script:LastFrameSeconds = $nowSeconds
+    if ($deltaSeconds -gt 0.05) {
+        $deltaSeconds = 0.05
+    }
+
+    Update-Windows -DeltaSeconds $deltaSeconds
+
+    if ($Iterations -gt 0) {
+        $script:FrameCount++
+        if ($script:FrameCount -ge $Iterations) {
+            Stop-Animation
+        }
+    }
+}
 
 try {
-    while ($script:Running) {
-        $now = $clock.ElapsedMilliseconds
-        $deltaSeconds = [Math]::Max(0.001, ($now - $lastFrameTick) / 1000.0)
-        $lastFrameTick = $now
-
-        if ($Iterations -gt 0 -and $now -ge $nextWallpaperTick) {
-            $index++
-            $nextWallpaperTick = $now + $WallpaperIntervalMs
-
-            if ($index -ge $Iterations) {
-                break
-            }
-        }
-
-        Update-Windows -DeltaSeconds $deltaSeconds
-        Invoke-DoEvents
-        Start-Sleep -Milliseconds $FrameDelayMs
-    }
+    [Windows.Media.CompositionTarget]::add_Rendering($script:RenderHandler)
+    [Windows.Threading.Dispatcher]::Run()
 }
 finally {
     Restore-State
