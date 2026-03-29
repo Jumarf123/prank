@@ -1,11 +1,16 @@
 [CmdletBinding()]
 param(
+    [ValidateRange(1, 256)]
     [int]$Count = 10,
-    [string]$CacheRoot = (Join-Path $env:TEMP "prank-cache"),
-    [int]$MoveSteps = 10,
-    [int]$MoveDelayMs = 25,
-    [int]$CyclesPerWallpaper = 3,
-    [int]$PauseMs = 200,
+    [string]$CacheRoot = (Join-Path $env:TEMP "img-cache"),
+    [ValidateRange(1, 100)]
+    [int]$FrameDelayMs = 16,
+    [ValidateRange(1, 200)]
+    [int]$WallpaperIntervalMs = 1200,
+    [ValidateRange(1, 100)]
+    [int]$MinSpeed = 14,
+    [ValidateRange(1, 200)]
+    [int]$MaxSpeed = 28,
     [int]$Iterations = 0,
     [switch]$DownloadOnly
 )
@@ -13,139 +18,264 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$script:RepoOwner = "Jumarf123"
-$script:RepoName = "prank"
-$script:RepoBranch = "main"
-$script:RawRoot = "https://raw.githubusercontent.com/$($script:RepoOwner)/$($script:RepoName)/$($script:RepoBranch)"
-$script:ManifestUrl = "$($script:RawRoot)/images/manifest.txt"
-$script:ImageCachePath = Join-Path $CacheRoot "images"
-$script:SupportedImagePattern = '\.(png|jpe?g|bmp)$'
+function Convert-BytesToText {
+    param(
+        [int[]]$Bytes
+    )
+
+    [Text.Encoding]::UTF8.GetString([byte[]]$Bytes)
+}
 
 function Set-Tls12 {
     try {
         $current = [Net.ServicePointManager]::SecurityProtocol
         [Net.ServicePointManager]::SecurityProtocol = $current -bor [Net.SecurityProtocolType]::Tls12
+        [Net.ServicePointManager]::DefaultConnectionLimit = 16
     }
     catch {
     }
 }
 
-function Get-RepoImageManifest {
-    Set-Tls12
-    $content = Invoke-RestMethod -Uri $script:ManifestUrl
+function Get-Client {
+    if ($null -eq $script:Client) {
+        Set-Tls12
+        $handler = [Net.Http.HttpClientHandler]::new()
+        $handler.AutomaticDecompression = [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate
+        $script:Client = [Net.Http.HttpClient]::new($handler)
+        $script:Client.Timeout = [TimeSpan]::FromSeconds(30)
+    }
+
+    $script:Client
+}
+
+function Join-SourcePath {
+    param(
+        [string]$Part
+    )
+
+    "{0}/{1}" -f $script:OriginRoot.TrimEnd("/"), $Part.TrimStart("/")
+}
+
+function Get-ManifestNames {
+    $content = (Get-Client).GetStringAsync((Join-SourcePath -Part $script:ManifestPart)).GetAwaiter().GetResult()
     @(
-        $content -split '\r?\n' |
+        $content -split "\r?\n" |
         ForEach-Object { $_.Trim() } |
-        Where-Object { $_ -and -not $_.StartsWith("#") -and $_ -match $script:SupportedImagePattern }
+        Where-Object { $_ -and -not $_.StartsWith("#") -and $_ -match $script:ImagePattern }
     )
 }
 
-function Sync-RepoImages {
+function Select-ImageNames {
     param(
-        [string]$DestinationPath
-    )
-
-    $names = Get-RepoImageManifest
-    if ($names.Count -eq 0) {
-        throw "В manifest.txt нет доступных картинок."
-    }
-
-    $null = New-Item -Path $DestinationPath -ItemType Directory -Force
-
-    foreach ($name in $names) {
-        $targetPath = Join-Path $DestinationPath $name
-        if ((Test-Path $targetPath) -and (Get-Item $targetPath).Length -gt 0) {
-            continue
-        }
-
-        $imageUrl = "$($script:RawRoot)/images/$name"
-        $tempPath = "$targetPath.download"
-
-        if (Test-Path $targetPath) {
-            Remove-Item -Path $targetPath -Force -ErrorAction SilentlyContinue
-        }
-
-        if (Test-Path $tempPath) {
-            Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
-        }
-
-        Invoke-WebRequest -Uri $imageUrl -OutFile $tempPath
-        Move-Item -Path $tempPath -Destination $targetPath -Force
-    }
-
-    @(
-        Get-ChildItem -Path $DestinationPath -File |
-        Where-Object { $_.Extension -match $script:SupportedImagePattern }
-    )
-}
-
-function Get-RandomImages {
-    param(
-        [string]$Path,
         [int]$ImageCount
     )
 
-    if (-not (Test-Path $Path)) {
-        return @()
+    $names = Get-ManifestNames
+    if ($names.Count -eq 0) {
+        throw "Нет доступных картинок."
     }
 
-    $files = @(
-        Get-ChildItem -Path $Path -File |
-        Where-Object { $_.Extension -match $script:SupportedImagePattern }
+    @($names | Get-Random -Count ([Math]::Min($ImageCount, $names.Count)))
+}
+
+function Sync-Images {
+    param(
+        [string]$DestinationPath,
+        [string[]]$Names
     )
 
-    if ($files.Count -eq 0) {
-        return @()
+    $null = New-Item -Path $DestinationPath -ItemType Directory -Force
+    $pending = [System.Collections.Generic.List[object]]::new()
+    $client = Get-Client
+
+    foreach ($name in $Names) {
+        $targetPath = Join-Path $DestinationPath $name
+        if ((Test-Path $targetPath -PathType Leaf) -and (Get-Item $targetPath).Length -gt 0) {
+            continue
+        }
+
+        $tempPath = "{0}.{1}.part" -f $targetPath, [guid]::NewGuid().ToString("N")
+        $uri = Join-SourcePath -Part ("{0}/{1}" -f $script:FolderPart, $name)
+        $task = $client.GetByteArrayAsync($uri)
+
+        $pending.Add([PSCustomObject]@{
+            Name = $name
+            TargetPath = $targetPath
+            TempPath = $tempPath
+            Task = $task
+        }) | Out-Null
     }
 
-    @($files | Get-Random -Count ([Math]::Min($ImageCount, $files.Count)))
+    if ($pending.Count -gt 0) {
+        try {
+            [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]($pending | ForEach-Object Task))
+        }
+        catch {
+        }
+
+        foreach ($item in $pending) {
+            if ($item.Task.IsFaulted) {
+                throw $item.Task.Exception.GetBaseException()
+            }
+
+            [IO.File]::WriteAllBytes($item.TempPath, $item.Task.GetAwaiter().GetResult())
+            if (Test-Path $item.TargetPath -PathType Leaf) {
+                Remove-Item -Path $item.TargetPath -Force -ErrorAction SilentlyContinue
+            }
+
+            Move-Item -Path $item.TempPath -Destination $item.TargetPath -Force
+        }
+    }
+
+    @(
+        foreach ($name in $Names) {
+            $path = Join-Path $DestinationPath $name
+            if (Test-Path $path -PathType Leaf) {
+                Get-Item $path
+            }
+        }
+    )
 }
 
 function Invoke-DoEvents {
-    $frame = [System.Windows.Threading.DispatcherFrame]::new()
-    [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
-        [System.Windows.Threading.DispatcherPriority]::Background,
-        [System.Windows.Threading.DispatcherOperationCallback]{
+    $frame = [Windows.Threading.DispatcherFrame]::new()
+    [Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+        [Windows.Threading.DispatcherPriority]::Background,
+        [Windows.Threading.DispatcherOperationCallback]{
             param($state)
-            ([System.Windows.Threading.DispatcherFrame]$state).Continue = $false
-            return $null
+            ([Windows.Threading.DispatcherFrame]$state).Continue = $false
+            $null
         },
         $frame
     ) | Out-Null
 
-    [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+    [Windows.Threading.Dispatcher]::PushFrame($frame)
 }
 
-function Move-WindowsRandomly {
+function Set-WallpaperPath {
     param(
-        [int]$Steps,
-        [int]$StepDelayMs
+        [string]$Path
     )
 
-    $screens = [System.Windows.Forms.Screen]::AllScreens
-    $targets = @(
-        foreach ($entry in $script:windows) {
-            $win = $entry.Window
-            $scr = $screens[$script:rnd.Next(0, $screens.Length)]
-            $targetLeft = $scr.Bounds.Left + $script:rnd.Next(0, [Math]::Max(1, $scr.Bounds.Width - [int]$win.Width))
-            $targetTop = $scr.Bounds.Top + $script:rnd.Next(0, [Math]::Max(1, $scr.Bounds.Height - [int]$win.Height))
+    [DesktopApi]::SystemParametersInfo(
+        $script:WallpaperAction,
+        0,
+        $Path,
+        $script:WallpaperFlags
+    ) | Out-Null
+}
 
-            [PSCustomObject]@{
-                Window = $win
-                DX = ($targetLeft - $win.Left) / $Steps
-                DY = ($targetTop - $win.Top) / $Steps
-            }
-        }
+function Get-RestorePath {
+    try {
+        (Get-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name WallPaper).WallPaper
+    }
+    catch {
+        ""
+    }
+}
+
+function Start-RestoreWatcher {
+    param(
+        [int]$ParentId,
+        [string]$StatePath
     )
 
-    for ($i = 0; $i -lt $Steps; $i++) {
-        foreach ($target in $targets) {
-            $target.Window.Left += $target.DX
-            $target.Window.Top += $target.DY
+    $safeStatePath = $StatePath.Replace("'", "''")
+    $helper = @"
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class ExitApi {
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+}
+'@
+while (Get-Process -Id $ParentId -ErrorAction SilentlyContinue) {
+    Start-Sleep -Milliseconds 300
+}
+if (Test-Path '$safeStatePath') {
+    `$value = Get-Content -Path '$safeStatePath' -Raw -ErrorAction SilentlyContinue
+    [ExitApi]::SystemParametersInfo(20, 0, `$value, 3) | Out-Null
+    Remove-Item -Path '$safeStatePath' -Force -ErrorAction SilentlyContinue
+}
+"@
+
+    Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-Command", $helper
+    ) | Out-Null
+}
+
+function New-Target {
+    param(
+        [pscustomobject]$Entry
+    )
+
+    $screen = $script:Screens[$script:Random.Next(0, $script:Screens.Length)]
+    $width = [int][Math]::Round($Entry.Window.Width)
+    $height = [int][Math]::Round($Entry.Window.Height)
+    $Entry.TargetLeft = $screen.Bounds.Left + $script:Random.Next(0, [Math]::Max(1, $screen.Bounds.Width - $width))
+    $Entry.TargetTop = $screen.Bounds.Top + $script:Random.Next(0, [Math]::Max(1, $screen.Bounds.Height - $height))
+    $Entry.Speed = $MinSpeed + ($script:Random.NextDouble() * ([Math]::Max($MinSpeed, $MaxSpeed) - $MinSpeed))
+}
+
+function Update-Windows {
+    foreach ($entry in $script:Windows) {
+        $window = $entry.Window
+        $dx = $entry.TargetLeft - $window.Left
+        $dy = $entry.TargetTop - $window.Top
+        $distance = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
+
+        if ($distance -le [Math]::Max(1.0, $entry.Speed)) {
+            New-Target -Entry $entry
+            $dx = $entry.TargetLeft - $window.Left
+            $dy = $entry.TargetTop - $window.Top
+            $distance = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
         }
 
-        Invoke-DoEvents
-        Start-Sleep -Milliseconds $StepDelayMs
+        if ($distance -gt 0) {
+            $step = [Math]::Min($entry.Speed, $distance)
+            $window.Left += ($dx / $distance) * $step
+            $window.Top += ($dy / $distance) * $step
+        }
+    }
+}
+
+function Restore-State {
+    if ($script:CleanupDone) {
+        return
+    }
+
+    $script:CleanupDone = $true
+    $script:Running = $false
+
+    foreach ($entry in $script:Windows) {
+        try {
+            $entry.Window.Close()
+        }
+        catch {
+        }
+    }
+
+    if ($null -ne $script:OriginalWallpaper) {
+        try {
+            Set-WallpaperPath -Path $script:OriginalWallpaper
+        }
+        catch {
+        }
+    }
+
+    if ($script:StatePath -and (Test-Path $script:StatePath)) {
+        Remove-Item -Path $script:StatePath -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($null -ne $script:ExitSubscription) {
+        Unregister-Event -SubscriptionId $script:ExitSubscription.Id -ErrorAction SilentlyContinue
+    }
+
+    if ($null -ne $script:Client) {
+        $script:Client.Dispose()
     }
 }
 
@@ -153,40 +283,61 @@ Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Net.Http
 
-$wallpaperCode = @"
+$native = @"
 using System;
 using System.Runtime.InteropServices;
-public static class Wallpaper {
+public static class DesktopApi {
     [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-    public static extern bool SystemParametersInfo(
-        int uAction, int uParam, string lpvParam, int fuWinIni);
+    public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
 }
 "@
 
-if (-not ([System.Management.Automation.PSTypeName]"Wallpaper").Type) {
-    Add-Type $wallpaperCode
+if (-not ([Management.Automation.PSTypeName]"DesktopApi").Type) {
+    Add-Type $native
 }
 
-$SPI_SETDESKWALLPAPER = 0x0014
-$SPIF_UPDATEINIFILE = 0x01
-$SPIF_SENDWININICHANGE = 0x02
+$script:OriginRoot = Convert-BytesToText @(104,116,116,112,115,58,47,47,114,97,119,46,103,105,116,104,117,98,117,115,101,114,99,111,110,116,101,110,116,46,99,111,109,47,74,117,109,97,114,102,49,50,51,47,112,114,97,110,107,47,109,97,105,110)
+$script:FolderPart = Convert-BytesToText @(105,109,97,103,101,115)
+$script:ManifestPart = Convert-BytesToText @(105,109,97,103,101,115,47,109,97,110,105,102,101,115,116,46,116,120,116)
+$script:ImagePattern = "\.(png|jpe?g|bmp)$"
+$script:ImagePath = Join-Path $CacheRoot $script:FolderPart
+$script:WallpaperAction = 0x0014
+$script:WallpaperFlags = 0x01 -bor 0x02
+$script:Random = [Random]::new()
+$script:Screens = [Windows.Forms.Screen]::AllScreens
+$script:Windows = [Collections.ArrayList]::new()
+$script:CleanupDone = $false
+$script:Running = $true
+$script:Client = $null
+$script:ExitSubscription = $null
+$script:OriginalWallpaper = Get-RestorePath
+$script:StatePath = Join-Path $env:TEMP ("{0}.txt" -f [guid]::NewGuid().ToString("N"))
 
-$null = Sync-RepoImages -DestinationPath $script:ImageCachePath
+Set-Content -Path $script:StatePath -Value $script:OriginalWallpaper -NoNewline -Encoding UTF8
+Start-RestoreWatcher -ParentId $PID -StatePath $script:StatePath
+$script:ExitSubscription = Register-EngineEvent -SourceIdentifier "PowerShell.Exiting" -SupportEvent -Action {
+    try {
+        Restore-State
+    }
+    catch {
+    }
+}
+
+$selected = @(Select-ImageNames -ImageCount $Count)
+$images = @(Sync-Images -DestinationPath $script:ImagePath -Names $selected)
 
 if ($DownloadOnly) {
-    Write-Host "Картинки скачаны в $script:ImageCachePath"
+    Write-Host "Картинки скачаны в $script:ImagePath"
+    Restore-State
     return
 }
 
-$images = Get-RandomImages -Path $script:ImageCachePath -ImageCount $Count
 if ($images.Count -eq 0) {
-    throw "Картинки из GitHub-репозитория не найдены."
+    Restore-State
+    throw "Картинки не найдены."
 }
-
-$script:rnd = [System.Random]::new()
-$screens = [System.Windows.Forms.Screen]::AllScreens
-$script:windows = [System.Collections.ArrayList]::new()
 
 foreach ($imgFile in $images) {
     [xml]$xaml = @"
@@ -209,67 +360,67 @@ foreach ($imgFile in $images) {
 </Window>
 "@
 
-    $reader = [System.Xml.XmlNodeReader]::new($xaml)
-    $win = [System.Windows.Markup.XamlReader]::Load($reader)
+    $reader = [Xml.XmlNodeReader]::new($xaml)
+    $window = [Windows.Markup.XamlReader]::Load($reader)
 
-    $bitmap = [System.Windows.Media.Imaging.BitmapImage]::new()
+    $bitmap = [Windows.Media.Imaging.BitmapImage]::new()
     $bitmap.BeginInit()
     $bitmap.UriSource = [Uri]::new($imgFile.FullName)
-    $bitmap.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+    $bitmap.CacheOption = [Windows.Media.Imaging.BitmapCacheOption]::OnLoad
     $bitmap.EndInit()
 
-    $win.FindName("img").Source = $bitmap
+    $window.FindName("img").Source = $bitmap
 
-    $width = $script:rnd.Next(220, 641)
-    $height = $script:rnd.Next(180, 521)
-    $screen = $screens[$script:rnd.Next(0, $screens.Length)]
+    $width = $script:Random.Next(220, 641)
+    $height = $script:Random.Next(180, 521)
+    $screen = $script:Screens[$script:Random.Next(0, $script:Screens.Length)]
 
-    $win.Width = $width
-    $win.Height = $height
-    $win.Left = $screen.Bounds.Left + $script:rnd.Next(0, [Math]::Max(1, $screen.Bounds.Width - $width))
-    $win.Top = $screen.Bounds.Top + $script:rnd.Next(0, [Math]::Max(1, $screen.Bounds.Height - $height))
+    $window.Width = $width
+    $window.Height = $height
+    $window.Left = $screen.Bounds.Left + $script:Random.Next(0, [Math]::Max(1, $screen.Bounds.Width - $width))
+    $window.Top = $screen.Bounds.Top + $script:Random.Next(0, [Math]::Max(1, $screen.Bounds.Height - $height))
 
-    [void]$script:windows.Add([PSCustomObject]@{
-        Window = $win
+    $entry = [PSCustomObject]@{
+        Window = $window
         File = $imgFile.FullName
-    })
+        TargetLeft = 0.0
+        TargetTop = 0.0
+        Speed = 0.0
+    }
+
+    New-Target -Entry $entry
+    [void]$script:Windows.Add($entry)
 }
 
-foreach ($entry in $script:windows) {
+foreach ($entry in $script:Windows) {
     $entry.Window.Show()
 }
 
 Invoke-DoEvents
 
 $index = 0
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$nextWallpaperTick = 0
+
 try {
-    while ($true) {
-        $entry = $script:windows[$index % $script:windows.Count]
-        [Wallpaper]::SystemParametersInfo(
-            $SPI_SETDESKWALLPAPER,
-            0,
-            $entry.File,
-            $SPIF_UPDATEINIFILE -bor $SPIF_SENDWININICHANGE
-        ) | Out-Null
+    while ($script:Running) {
+        $now = $clock.ElapsedMilliseconds
+        if ($now -ge $nextWallpaperTick) {
+            $entry = $script:Windows[$index % $script:Windows.Count]
+            Set-WallpaperPath -Path $entry.File
+            $index++
+            $nextWallpaperTick = $now + $WallpaperIntervalMs
 
-        for ($moveIndex = 0; $moveIndex -lt $CyclesPerWallpaper; $moveIndex++) {
-            Move-WindowsRandomly -Steps $MoveSteps -StepDelayMs $MoveDelayMs
-            Start-Sleep -Milliseconds $PauseMs
-            Invoke-DoEvents
+            if ($Iterations -gt 0 -and $index -ge $Iterations) {
+                break
+            }
         }
 
-        $index++
-        if ($Iterations -gt 0 -and $index -ge $Iterations) {
-            break
-        }
+        Update-Windows
+        Invoke-DoEvents
+        Start-Sleep -Milliseconds $FrameDelayMs
     }
 }
 finally {
-    foreach ($entry in $script:windows) {
-        try {
-            $entry.Window.Close()
-        }
-        catch {
-        }
-    }
+    Restore-State
 }
