@@ -4,13 +4,13 @@ param(
     [int]$Count = 10,
     [string]$CacheRoot = (Join-Path $env:TEMP "img-cache"),
     [ValidateRange(1, 100)]
-    [int]$FrameDelayMs = 16,
+    [int]$FrameDelayMs = 8,
     [ValidateRange(1, 200)]
     [int]$WallpaperIntervalMs = 1200,
-    [ValidateRange(1, 100)]
-    [int]$MinSpeed = 14,
-    [ValidateRange(1, 200)]
-    [int]$MaxSpeed = 28,
+    [ValidateRange(100, 8000)]
+    [int]$MinSpeed = 1100,
+    [ValidateRange(100, 8000)]
+    [int]$MaxSpeed = 2200,
     [int]$Iterations = 0,
     [switch]$DownloadOnly
 )
@@ -207,38 +207,67 @@ if (Test-Path '$safeStatePath') {
     ) | Out-Null
 }
 
-function New-Target {
+function Set-MotionVector {
+    param(
+        [pscustomobject]$Entry,
+        [double]$Angle,
+        [double]$Speed
+    )
+
+    $clampedSpeed = [Math]::Max($MinSpeed, [Math]::Min($MaxSpeed, $Speed))
+    $Entry.VX = [Math]::Cos($Angle) * $clampedSpeed
+    $Entry.VY = [Math]::Sin($Angle) * $clampedSpeed
+}
+
+function Initialize-Motion {
     param(
         [pscustomobject]$Entry
     )
 
-    $screen = $script:Screens[$script:Random.Next(0, $script:Screens.Length)]
-    $width = [int][Math]::Round($Entry.Window.Width)
-    $height = [int][Math]::Round($Entry.Window.Height)
-    $Entry.TargetLeft = $screen.Bounds.Left + $script:Random.Next(0, [Math]::Max(1, $screen.Bounds.Width - $width))
-    $Entry.TargetTop = $screen.Bounds.Top + $script:Random.Next(0, [Math]::Max(1, $screen.Bounds.Height - $height))
-    $Entry.Speed = $MinSpeed + ($script:Random.NextDouble() * ([Math]::Max($MinSpeed, $MaxSpeed) - $MinSpeed))
+    Set-MotionVector -Entry $Entry -Angle ($script:Random.NextDouble() * [Math]::PI * 2) -Speed ($MinSpeed + ($script:Random.NextDouble() * ($MaxSpeed - $MinSpeed)))
+    $Entry.NextTurnTick = $script:Random.Next(140, 420)
 }
 
 function Update-Windows {
+    param(
+        [double]$DeltaSeconds,
+        [double]$NowMs
+    )
+
     foreach ($entry in $script:Windows) {
+        if ($NowMs -ge $entry.NextTurnTick) {
+            $angle = [Math]::Atan2($entry.VY, $entry.VX) + (($script:Random.NextDouble() * 0.9) - 0.45)
+            $speed = [Math]::Sqrt(($entry.VX * $entry.VX) + ($entry.VY * $entry.VY)) + $script:Random.Next(-220, 221)
+            Set-MotionVector -Entry $entry -Angle $angle -Speed $speed
+            $entry.NextTurnTick = $NowMs + $script:Random.Next(140, 420)
+        }
+
         $window = $entry.Window
-        $dx = $entry.TargetLeft - $window.Left
-        $dy = $entry.TargetTop - $window.Top
-        $distance = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
+        $newLeft = $window.Left + ($entry.VX * $DeltaSeconds)
+        $newTop = $window.Top + ($entry.VY * $DeltaSeconds)
+        $maxLeft = $script:DesktopBounds.Right - $window.Width
+        $maxTop = $script:DesktopBounds.Bottom - $window.Height
 
-        if ($distance -le [Math]::Max(1.0, $entry.Speed)) {
-            New-Target -Entry $entry
-            $dx = $entry.TargetLeft - $window.Left
-            $dy = $entry.TargetTop - $window.Top
-            $distance = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
+        if ($newLeft -lt $script:DesktopBounds.Left) {
+            $newLeft = $script:DesktopBounds.Left
+            $entry.VX = [Math]::Abs($entry.VX)
+        }
+        elseif ($newLeft -gt $maxLeft) {
+            $newLeft = $maxLeft
+            $entry.VX = -[Math]::Abs($entry.VX)
         }
 
-        if ($distance -gt 0) {
-            $step = [Math]::Min($entry.Speed, $distance)
-            $window.Left += ($dx / $distance) * $step
-            $window.Top += ($dy / $distance) * $step
+        if ($newTop -lt $script:DesktopBounds.Top) {
+            $newTop = $script:DesktopBounds.Top
+            $entry.VY = [Math]::Abs($entry.VY)
         }
+        elseif ($newTop -gt $maxTop) {
+            $newTop = $maxTop
+            $entry.VY = -[Math]::Abs($entry.VY)
+        }
+
+        $window.Left = $newLeft
+        $window.Top = $newTop
     }
 }
 
@@ -307,6 +336,7 @@ $script:WallpaperAction = 0x0014
 $script:WallpaperFlags = 0x01 -bor 0x02
 $script:Random = [Random]::new()
 $script:Screens = [Windows.Forms.Screen]::AllScreens
+$script:DesktopBounds = [Windows.Forms.SystemInformation]::VirtualScreen
 $script:Windows = [Collections.ArrayList]::new()
 $script:CleanupDone = $false
 $script:Running = $true
@@ -383,12 +413,12 @@ foreach ($imgFile in $images) {
     $entry = [PSCustomObject]@{
         Window = $window
         File = $imgFile.FullName
-        TargetLeft = 0.0
-        TargetTop = 0.0
-        Speed = 0.0
+        VX = 0.0
+        VY = 0.0
+        NextTurnTick = 0.0
     }
 
-    New-Target -Entry $entry
+    Initialize-Motion -Entry $entry
     [void]$script:Windows.Add($entry)
 }
 
@@ -400,11 +430,15 @@ Invoke-DoEvents
 
 $index = 0
 $clock = [Diagnostics.Stopwatch]::StartNew()
+$lastFrameTick = 0
 $nextWallpaperTick = 0
 
 try {
     while ($script:Running) {
         $now = $clock.ElapsedMilliseconds
+        $deltaSeconds = [Math]::Max(0.001, ($now - $lastFrameTick) / 1000.0)
+        $lastFrameTick = $now
+
         if ($now -ge $nextWallpaperTick) {
             $entry = $script:Windows[$index % $script:Windows.Count]
             Set-WallpaperPath -Path $entry.File
@@ -416,7 +450,7 @@ try {
             }
         }
 
-        Update-Windows
+        Update-Windows -DeltaSeconds $deltaSeconds -NowMs $now
         Invoke-DoEvents
         Start-Sleep -Milliseconds $FrameDelayMs
     }
