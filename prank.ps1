@@ -288,21 +288,6 @@ function Update-Windows {
     }
 }
 
-function Update-FakeConsoles {
-    param(
-        [double]$NowSeconds
-    )
-
-    foreach ($entry in $script:ConsoleWindows) {
-        if ($NowSeconds -lt $entry.NextLineSeconds) {
-            continue
-        }
-
-        Add-FakeConsoleLine -Entry $entry
-        $entry.NextLineSeconds = $NowSeconds + (0.14 + ($script:Random.NextDouble() * 0.28))
-    }
-}
-
 function Stop-Animation {
     if (-not $script:Running) {
         return
@@ -355,99 +340,6 @@ function Show-AntivirusOverlay {
     $window
 }
 
-function New-FakeConsoleWindow {
-    param(
-        [int]$NodeId
-    )
-
-    [xml]$xaml = @"
-<Window
-    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    WindowStyle="SingleBorderWindow"
-    ResizeMode="NoResize"
-    ShowInTaskbar="False"
-    Topmost="True"
-    Background="#0C0C0C"
-    Foreground="#39FF14"
-    Width="720"
-    Height="300"
-    Title="SYSTEM NODE">
-    <Grid Background="#0C0C0C">
-        <TextBox x:Name="consoleOutput"
-                 Padding="10"
-                 BorderThickness="0"
-                 Background="#0C0C0C"
-                 Foreground="#39FF14"
-                 FontFamily="Consolas"
-                 FontSize="14"
-                 IsReadOnly="True"
-                 TextWrapping="NoWrap"
-                 VerticalScrollBarVisibility="Hidden"
-                 HorizontalScrollBarVisibility="Disabled"
-                 AcceptsReturn="True"/>
-    </Grid>
-</Window>
-"@
-
-    $reader = [Xml.XmlNodeReader]::new($xaml)
-    $window = [Windows.Markup.XamlReader]::Load($reader)
-    $output = $window.FindName("consoleOutput")
-    $screen = $script:Screens[$script:Random.Next(0, $script:Screens.Length)]
-    $window.Title = "SYSTEM NODE $NodeId"
-    $window.Left = $screen.Bounds.Left + $script:Random.Next(0, [Math]::Max(1, $screen.Bounds.Width - [int]$window.Width))
-    $window.Top = $screen.Bounds.Top + $script:Random.Next(0, [Math]::Max(1, $screen.Bounds.Height - [int]$window.Height))
-    $window.Show()
-
-    $output.AppendText("Microsoft Windows [Version 10.0.19045.0000]`r`n")
-    $output.AppendText("(c) Microsoft Corporation. All rights reserved.`r`n`r`n")
-    $output.AppendText("C:\Windows\system32> color 2`r`n")
-    $output.AppendText("C:\Windows\system32> dir /s`r`n")
-    $output.AppendText("[BOOT] launching remote shell node $NodeId`r`n`r`n")
-    $output.ScrollToEnd()
-
-    [PSCustomObject]@{
-        Window = $window
-        Output = $output
-        NodeId = $NodeId
-        NextLineSeconds = 0.0
-    }
-}
-
-function Add-FakeConsoleLine {
-    param(
-        [pscustomobject]$Entry
-    )
-
-    $lines = @(
-        "[{0}] node {1}: acquiring session token {2}{3}" -f (Get-Date -Format "HH:mm:ss"), $Entry.NodeId, $script:Random.Next(1000, 9999), $script:Random.Next(1000, 9999)
-        "[{0}] node {1}: reading memory page {2}" -f (Get-Date -Format "HH:mm:ss"), $Entry.NodeId, $script:Random.Next(10000, 99999)
-        "[{0}] node {1}: syncing registry delta {2}-{3}" -f (Get-Date -Format "HH:mm:ss"), $Entry.NodeId, $script:Random.Next(1000, 9999), $script:Random.Next(1000, 9999)
-        "[{0}] node {1}: bypass chain ok, tunnel depth {2}" -f (Get-Date -Format "HH:mm:ss"), $Entry.NodeId, $script:Random.Next(10, 99)
-        "[{0}] node {1}: uplink established, checksum {2}{3}" -f (Get-Date -Format "HH:mm:ss"), $Entry.NodeId, $script:Random.Next(1000, 9999), $script:Random.Next(1000, 9999)
-    )
-
-    $Entry.Output.AppendText($lines[$script:Random.Next(0, $lines.Count)] + "`r`n")
-    $parts = $Entry.Output.Text -split "`r?`n"
-    if ($parts.Count -gt 18) {
-        $Entry.Output.Text = (($parts | Select-Object -Last 18) -join "`r`n").TrimStart("`r", "`n")
-    }
-
-    $Entry.Output.CaretIndex = $Entry.Output.Text.Length
-    $Entry.Output.ScrollToEnd()
-}
-
-function Start-FakeConsoles {
-    $count = $script:Random.Next(2, 4)
-    $script:ConsoleWindows.Clear()
-
-    for ($i = 1; $i -le $count; $i++) {
-        [void]$script:ConsoleWindows.Add((New-FakeConsoleWindow -NodeId $i))
-    }
-
-    Save-StateFile
-}
-
 function Restore-State {
     if ($script:CleanupDone) {
         return
@@ -465,14 +357,6 @@ function Restore-State {
     }
 
     foreach ($entry in $script:Windows) {
-        try {
-            $entry.Window.Close()
-        }
-        catch {
-        }
-    }
-
-    foreach ($entry in $script:ConsoleWindows) {
         try {
             $entry.Window.Close()
         }
@@ -555,7 +439,6 @@ $script:Random = [Random]::new()
 $script:Screens = [Windows.Forms.Screen]::AllScreens
 $script:DesktopBounds = [Windows.Forms.SystemInformation]::VirtualScreen
 $script:Windows = [Collections.ArrayList]::new()
-$script:ConsoleWindows = [Collections.ArrayList]::new()
 $script:ConsoleProcesses = [Collections.ArrayList]::new()
 $script:TempFiles = [Collections.ArrayList]::new()
 $script:OverlayWindow = $null
@@ -650,7 +533,6 @@ foreach ($entry in $script:Windows) {
 }
 
 $script:OverlayWindow = Show-AntivirusOverlay -ImagePath $overlayAsset.FullName
-Start-FakeConsoles
 Set-WallpaperPath -Path $images[$script:Random.Next(0, $images.Count)].FullName
 
 $script:MainDispatcher = [Windows.Threading.Dispatcher]::CurrentDispatcher
@@ -676,7 +558,6 @@ $script:RenderHandler = [EventHandler]{
     }
 
     Update-Windows -DeltaSeconds $deltaSeconds
-    Update-FakeConsoles -NowSeconds $nowSeconds
 
     if ($Iterations -gt 0) {
         $script:FrameCount++
