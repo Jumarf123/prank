@@ -133,6 +133,44 @@ function Sync-Images {
     )
 }
 
+function Sync-File {
+    param(
+        [string]$DestinationPath,
+        [string]$RelativePart
+    )
+
+    $null = New-Item -Path (Split-Path -Parent $DestinationPath) -ItemType Directory -Force
+    if ((Test-Path $DestinationPath -PathType Leaf) -and (Get-Item $DestinationPath).Length -gt 0) {
+        return Get-Item $DestinationPath
+    }
+
+    $tempPath = "{0}.{1}.part" -f $DestinationPath, [guid]::NewGuid().ToString("N")
+    $bytes = (Get-Client).GetByteArrayAsync((Join-SourcePath -Part $RelativePart)).GetAwaiter().GetResult()
+    [IO.File]::WriteAllBytes($tempPath, $bytes)
+
+    if (Test-Path $DestinationPath -PathType Leaf) {
+        Remove-Item -Path $DestinationPath -Force -ErrorAction SilentlyContinue
+    }
+
+    Move-Item -Path $tempPath -Destination $DestinationPath -Force
+    Get-Item $DestinationPath
+}
+
+function Resolve-AssetFile {
+    param(
+        [string]$RelativePart,
+        [string]$DestinationPath
+    )
+
+    $localRelative = $RelativePart -replace "/", "\"
+    $localPath = Join-Path $script:BaseDirectory $localRelative
+    if (Test-Path $localPath -PathType Leaf) {
+        return Get-Item $localPath
+    }
+
+    Sync-File -DestinationPath $DestinationPath -RelativePart $RelativePart
+}
+
 function Set-WallpaperPath {
     param(
         [string]$Path
@@ -175,8 +213,14 @@ while (Get-Process -Id $ParentId -ErrorAction SilentlyContinue) {
     Start-Sleep -Milliseconds 300
 }
 if (Test-Path '$safeStatePath') {
-    `$value = Get-Content -Path '$safeStatePath' -Raw -ErrorAction SilentlyContinue
-    [ExitApi]::SystemParametersInfo(20, 0, `$value, 3) | Out-Null
+    `$state = Get-Content -Path '$safeStatePath' -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+    foreach (`$pid in @(`$state.consolePids)) {
+        Stop-Process -Id `$pid -Force -ErrorAction SilentlyContinue
+    }
+    foreach (`$tempFile in @(`$state.tempFiles)) {
+        Remove-Item -Path `$tempFile -Force -ErrorAction SilentlyContinue
+    }
+    [ExitApi]::SystemParametersInfo(20, 0, `$state.wallpaper, 3) | Out-Null
     Remove-Item -Path '$safeStatePath' -Force -ErrorAction SilentlyContinue
 }
 "@
@@ -186,6 +230,22 @@ if (Test-Path '$safeStatePath') {
         "-ExecutionPolicy", "Bypass",
         "-Command", $helper
     ) | Out-Null
+}
+
+function Save-StateFile {
+    $payload = [ordered]@{
+        wallpaper = $script:OriginalWallpaper
+        consolePids = @(
+            $script:ConsoleProcesses |
+            Where-Object { $_ -and -not $_.HasExited } |
+            ForEach-Object { $_.Id }
+        )
+        tempFiles = @($script:TempFiles)
+    }
+
+    $payload |
+        ConvertTo-Json -Compress |
+        Set-Content -Path $script:StatePath -Encoding UTF8 -NoNewline
 }
 
 function Set-MotionVector {
@@ -255,6 +315,85 @@ function Stop-Animation {
     }
 }
 
+function Show-AntivirusOverlay {
+    param(
+        [string]$ImagePath
+    )
+
+    [xml]$xaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    WindowStyle="None"
+    ResizeMode="NoResize"
+    SizeToContent="WidthAndHeight"
+    AllowsTransparency="True"
+    Background="Transparent"
+    Topmost="True"
+    ShowInTaskbar="False"
+    ShowActivated="False">
+    <Border CornerRadius="14" BorderThickness="2" BorderBrush="#CCFFFFFF" Background="#01000000">
+        <Image x:Name="overlayImage" Stretch="Uniform" MaxWidth="420" MaxHeight="240"/>
+    </Border>
+</Window>
+"@
+
+    $reader = [Xml.XmlNodeReader]::new($xaml)
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    $bitmap = [Windows.Media.Imaging.BitmapImage]::new()
+    $bitmap.BeginInit()
+    $bitmap.UriSource = [Uri]::new($ImagePath)
+    $bitmap.CacheOption = [Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+    $bitmap.EndInit()
+    $window.FindName("overlayImage").Source = $bitmap
+    $window.Show()
+    $window.UpdateLayout()
+
+    $workArea = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $window.Left = $workArea.Right - $window.ActualWidth - 16
+    $window.Top = $workArea.Bottom - $window.ActualHeight - 16
+    $window
+}
+
+function New-FakeConsoleScript {
+    $path = Join-Path $env:TEMP ("{0}.cmd" -f [guid]::NewGuid().ToString("N"))
+    $content = @'
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+title SYSTEM NODE %1
+color 0A
+mode con: cols=86 lines=24
+echo.
+echo [BOOT] launching remote shell node %1
+echo.
+:loop
+echo [!time!] node %1: acquiring session token !random!!random!
+echo [!time!] node %1: reading memory page !random!
+echo [!time!] node %1: syncing registry delta !random!-!random!
+echo [!time!] node %1: bypass chain ok, tunnel depth !random!
+echo [!time!] node %1: uplink established, checksum !random!!random!
+ping 127.0.0.1 -n 2 >nul
+goto loop
+'@
+
+    Set-Content -Path $path -Value $content -Encoding Ascii
+    [void]$script:TempFiles.Add($path)
+    $path
+}
+
+function Start-FakeConsoles {
+    $count = $script:Random.Next(2, 4)
+    $scriptPath = New-FakeConsoleScript
+
+    for ($i = 1; $i -le $count; $i++) {
+        $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/k `"$scriptPath`" $i" -PassThru
+        [void]$script:ConsoleProcesses.Add($process)
+        Start-Sleep -Milliseconds 120
+    }
+
+    Save-StateFile
+}
+
 function Restore-State {
     if ($script:CleanupDone) {
         return
@@ -277,6 +416,28 @@ function Restore-State {
         }
         catch {
         }
+    }
+
+    if ($null -ne $script:OverlayWindow) {
+        try {
+            $script:OverlayWindow.Close()
+        }
+        catch {
+        }
+    }
+
+    foreach ($process in $script:ConsoleProcesses) {
+        try {
+            if ($process -and -not $process.HasExited) {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+        }
+    }
+
+    foreach ($tempFile in $script:TempFiles) {
+        Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
     }
 
     if ($null -ne $script:OriginalWallpaper) {
@@ -324,12 +485,18 @@ $script:FolderPart = Convert-BytesToText @(105,109,97,103,101,115)
 $script:ManifestPart = Convert-BytesToText @(105,109,97,103,101,115,47,109,97,110,105,102,101,115,116,46,116,120,116)
 $script:ImagePattern = "\.(png|jpe?g|bmp)$"
 $script:ImagePath = Join-Path $CacheRoot $script:FolderPart
+$script:OverlayPart = "antivirus/i.png"
+$script:OverlayPath = Join-Path (Join-Path $CacheRoot "antivirus") "i.png"
+$script:BaseDirectory = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 $script:WallpaperAction = 0x0014
 $script:WallpaperFlags = 0x01 -bor 0x02
 $script:Random = [Random]::new()
 $script:Screens = [Windows.Forms.Screen]::AllScreens
 $script:DesktopBounds = [Windows.Forms.SystemInformation]::VirtualScreen
 $script:Windows = [Collections.ArrayList]::new()
+$script:ConsoleProcesses = [Collections.ArrayList]::new()
+$script:TempFiles = [Collections.ArrayList]::new()
+$script:OverlayWindow = $null
 $script:CleanupDone = $false
 $script:Running = $true
 $script:Client = $null
@@ -339,7 +506,7 @@ $script:MainDispatcher = $null
 $script:OriginalWallpaper = Get-RestorePath
 $script:StatePath = Join-Path $env:TEMP ("{0}.txt" -f [guid]::NewGuid().ToString("N"))
 
-Set-Content -Path $script:StatePath -Value $script:OriginalWallpaper -NoNewline -Encoding UTF8
+Save-StateFile
 Start-RestoreWatcher -ParentId $PID -StatePath $script:StatePath
 $script:ExitSubscription = Register-EngineEvent -SourceIdentifier "PowerShell.Exiting" -SupportEvent -Action {
     try {
@@ -351,9 +518,10 @@ $script:ExitSubscription = Register-EngineEvent -SourceIdentifier "PowerShell.Ex
 
 $selected = @(Select-ImageNames -ImageCount $Count)
 $images = @(Sync-Images -DestinationPath $script:ImagePath -Names $selected)
+$overlayAsset = Resolve-AssetFile -DestinationPath $script:OverlayPath -RelativePart $script:OverlayPart
 
 if ($DownloadOnly) {
-    Write-Host "Картинки скачаны в $script:ImagePath"
+    Write-Host "Картинки скачаны в $script:ImagePath и $($overlayAsset.FullName)"
     Restore-State
     return
 }
@@ -419,6 +587,8 @@ foreach ($entry in $script:Windows) {
     $entry.Window.Show()
 }
 
+$script:OverlayWindow = Show-AntivirusOverlay -ImagePath $overlayAsset.FullName
+Start-FakeConsoles
 Set-WallpaperPath -Path $images[$script:Random.Next(0, $images.Count)].FullName
 
 $script:MainDispatcher = [Windows.Threading.Dispatcher]::CurrentDispatcher
