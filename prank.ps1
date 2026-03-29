@@ -156,21 +156,6 @@ function Sync-File {
     Get-Item $DestinationPath
 }
 
-function Resolve-AssetFile {
-    param(
-        [string]$RelativePart,
-        [string]$DestinationPath
-    )
-
-    $localRelative = $RelativePart -replace "/", "\"
-    $localPath = Join-Path $script:BaseDirectory $localRelative
-    if (Test-Path $localPath -PathType Leaf) {
-        return Get-Item $localPath
-    }
-
-    Sync-File -DestinationPath $DestinationPath -RelativePart $RelativePart
-}
-
 function Set-WallpaperPath {
     param(
         [string]$Path
@@ -487,7 +472,6 @@ $script:ImagePattern = "\.(png|jpe?g|bmp)$"
 $script:ImagePath = Join-Path $CacheRoot $script:FolderPart
 $script:OverlayPart = "antivirus/i.png"
 $script:OverlayPath = Join-Path (Join-Path $CacheRoot "antivirus") "i.png"
-$script:BaseDirectory = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 $script:WallpaperAction = 0x0014
 $script:WallpaperFlags = 0x01 -bor 0x02
 $script:Random = [Random]::new()
@@ -518,7 +502,7 @@ $script:ExitSubscription = Register-EngineEvent -SourceIdentifier "PowerShell.Ex
 
 $selected = @(Select-ImageNames -ImageCount $Count)
 $images = @(Sync-Images -DestinationPath $script:ImagePath -Names $selected)
-$overlayAsset = Resolve-AssetFile -DestinationPath $script:OverlayPath -RelativePart $script:OverlayPart
+$overlayAsset = Sync-File -DestinationPath $script:OverlayPath -RelativePart $script:OverlayPart
 
 if ($DownloadOnly) {
     Write-Host "Картинки скачаны в $script:ImagePath и $($overlayAsset.FullName)"
