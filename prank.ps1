@@ -340,38 +340,29 @@ function Show-AntivirusOverlay {
     $window
 }
 
-function New-FakeConsoleScript {
-    $path = Join-Path $env:TEMP ("{0}.cmd" -f [guid]::NewGuid().ToString("N"))
-    $content = @'
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-title SYSTEM NODE %1
-color 0A
-mode con: cols=86 lines=24
-echo.
-echo [BOOT] launching remote shell node %1
-echo.
-:loop
-echo [!time!] node %1: acquiring session token !random!!random!
-echo [!time!] node %1: reading memory page !random!
-echo [!time!] node %1: syncing registry delta !random!-!random!
-echo [!time!] node %1: bypass chain ok, tunnel depth !random!
-echo [!time!] node %1: uplink established, checksum !random!!random!
-ping 127.0.0.1 -n 2 >nul
-goto loop
-'@
-
-    Set-Content -Path $path -Value $content -Encoding Ascii
-    [void]$script:TempFiles.Add($path)
-    $path
-}
-
 function Start-FakeConsoles {
     $count = $script:Random.Next(2, 4)
-    $scriptPath = New-FakeConsoleScript
 
     for ($i = 1; $i -le $count; $i++) {
-        $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/k `"$scriptPath`" $i" -PassThru
+        $command = @(
+            "setlocal EnableExtensions EnableDelayedExpansion"
+            "title SYSTEM NODE $i"
+            "color 0A"
+            "mode con: cols=86 lines=24"
+            "echo."
+            "echo [BOOT] launching remote shell node $i"
+            "echo."
+            ":loop"
+            "echo [!time!] node ${i}: acquiring session token !random!!random!"
+            "echo [!time!] node ${i}: reading memory page !random!"
+            "echo [!time!] node ${i}: syncing registry delta !random!-!random!"
+            "echo [!time!] node ${i}: bypass chain ok, tunnel depth !random!"
+            "echo [!time!] node ${i}: uplink established, checksum !random!!random!"
+            "ping 127.0.0.1 -n 2 >nul"
+            "goto loop"
+        ) -join " & "
+
+        $process = Start-Process -FilePath "cmd.exe" -ArgumentList @("/v:on", "/k", $command) -PassThru
         [void]$script:ConsoleProcesses.Add($process)
         Start-Sleep -Milliseconds 120
     }
